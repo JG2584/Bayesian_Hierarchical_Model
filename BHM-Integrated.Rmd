@@ -20,7 +20,7 @@ library(posterior)
 library(tidyverse)
 library(forestplot)
 library(dplyr)
-setwd("/Users/beep/Downloads/申研/Cambridge/学术/Haiyan Zheng/Mphil project")
+setwd("/Users/beep/Downloads/Mphil project")
 ```
 
 # Simulation Study
