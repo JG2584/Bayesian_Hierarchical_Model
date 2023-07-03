@@ -1,5 +1,6 @@
 # Bayesian_Hierarchical_Model
 MPhil Dissertation
+
 This code implements a simulation study for a Bayesian hierarchical modeling (BHM) basket trial. The purpose of the study is to evaluate different prior specifications and their impact on the type 1 error rate and statistical power of the trial. The code consists of the following main components:
 
 Simulation Study:
