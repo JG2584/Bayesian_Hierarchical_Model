@@ -1,0 +1,33 @@
+model
+{
+  for(k in 1:K) # For each subtrial, K total number of subtrials
+  {
+    for(j in 1:Na) # for each arm (E/C)
+    {
+      # Binomial likelihood
+      y[k,j] ~ dbin(p[k,j], n[k,j])
+    }
+    
+    logit(p[k,1]) <- gamma[k]
+    logit(p[k,2]) <- gamma[k] + theta[k]
+    
+    # random effects with a common mean mu
+    theta[k] ~ dnorm(mu, prec.sigma[which])
+    #theta_or[k] <- exp(theta[k])
+  
+    # baseline log odds for subrial i
+    gamma[k] ~ dnorm(0, 1 / 10^2)
+  }
+  
+  #Prior
+  mu ~ dnorm(0, 1/ 10^2)
+  
+  #Precision
+  which ~ dcat(wMix[1:2])
+  prec.sigma[1] ~ dgamma(prior.exop[1],prior.exop[2])
+  prec.sigma[2] ~ dunif(0,100)
+  
+  var.sigma[1] <-  1 / (prec.sigma[1]+0.0001) 
+  #Avoid prec.sigma = 0 resulting inflating the variance due to this artificial specification
+  var.sigma[2] <-  1 / prec.sigma[2]
+}

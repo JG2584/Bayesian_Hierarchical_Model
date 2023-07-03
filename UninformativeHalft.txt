@@ -1,0 +1,28 @@
+model
+{
+  for(k in 1:K) # For each subtrial, K total number of subtrials
+  {
+    for(j in 1:Na) # for each arm (E/C)
+    {
+      # Binomial likelihood
+      y[k,j] ~ dbin(p[k,j], n[k,j])
+    }
+    
+    logit(p[k,1]) <- gamma[k]
+    logit(p[k,2]) <- gamma[k] + theta[k]
+    
+    # random effects with a common mean mu
+    theta[k] ~ dnorm(mu, prec.sigma)
+    theta_or[k] <- exp(theta[k])
+  
+    # baseline log odds for subrial i
+    gamma[k] ~ dnorm(0, 1 / 10^2)
+  }
+  
+  #Prior
+  mu ~ dnorm(0, 1/ 10^2)
+  prec.sigma <- 1 / var.sigma
+  #Vague Prior: Scale parameter:100 (larger, more spread out)
+  #Degree of freedom:1 Cauchy distribution
+  var.sigma ~ dt(0,100,3)T(0,)
+}
