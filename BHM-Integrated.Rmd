@@ -1,0 +1,673 @@
+---
+title: "Prior Specification for BHM basket trial"
+date: '2023-06-01'
+output:
+  pdf_document:
+    number_sections: true
+params:
+  solutions: TRUE
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_file = file.path(dirname(inputFile), '0379Dissertation.pdf')) })
+editor_options:
+  chunk_output_type: console
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rjags)
+library(posterior)
+library(tidyverse)
+library(forestplot)
+library(dplyr)
+setwd("/Users/beep/Downloads/申研/Cambridge/学术/Haiyan Zheng/Mphil project")
+```
+
+# Simulation Study
+
+## Define function
+
+Three functions are defined to complete the project.
+
+(1) *scntb* is a function that takes the sample size for all 7 subtrials and alternating treatment group response rates and control group response rates for each subtrial; the output is the table has 8 columns : 
+1 Subtrial number; 
+2,3,4/5,6,7 number of responses, number of patients and the true response rate for the treatment and control group for each subtrial respectively; 
+8 true log odds ratio for each subtrial calculated from formula: 
+
+$$log(\frac{p_E}{1 - p_E} ) - log(\frac{p_C}{1 - p_C})$$
+
+(2) *logit* is a function which gives the logit of probability *p*.
+
+(3) *sim_procedure* is a function which takes the procedure number, the scenario data table,number of chains, number of Burn-in, number of Iterations, the weight for mixture prior, the calibrated alpha and beta and the threshold sigma to decide Go or No-go.
+
+```{r Simulate Data}
+
+#Input is the (1) trial size for each subtrial (the sum of experimental group and control group) (2) alternating treatment group response rates and control group response rates for each subtrial
+
+scntb <- function(trial_size,pvalues) {
+  subtrial <- c()
+  trt_gp <- c()
+  for (i in 1:length(trial_size)){
+    #print(trial_size[i])
+    subtrial <- c(subtrial,rep(i,trial_size[i]))
+    trt_gp <- c(trt_gp,rep(1,trial_size[i]/2),rep(0,trial_size[i]/2))
+    }
+  #print(subtrial)
+  #print(trt_gp)
+  ksubtrial = length(unique(subtrial))
+  npatients = length(trt_gp)
+  response <- c()
+  true_p <- c()
+  for (j in 1:length(pvalues)){
+    p <- pvalues[j]
+    #set.seed(43)
+    if (j %% 2 == 1) {
+      rsp_sub <- rbinom(trial_size[j %/% 2+1]/2,1,p)
+      true_p <- c(true_p,rep(p,trial_size[j %/% 2+1]/2))}
+    else {
+      rsp_sub <- rbinom(trial_size[j/2]/2,1,p)
+      true_p <- c(true_p,rep(p,trial_size[j/2]/2))}
+    response <- c(response, rsp_sub)
+    
+  }
+  scntb <- data.frame(ID = 1:npatients, TreatmentGroup = trt_gp, 
+                      Response = response,True_p = true_p,
+                      Subtrial = subtrial)%>%
+  group_by(Subtrial) %>%
+  reframe(
+    response_tr = sum(Response[TreatmentGroup == 1]),
+    n_tr = sum(Subtrial[TreatmentGroup == 1]) / Subtrial,
+    p_tr = sum(True_p[TreatmentGroup == 1])/n_tr,
+    response_ct = sum(Response[TreatmentGroup == 0]),
+    n_ct = sum(Subtrial[TreatmentGroup == 0]) / Subtrial,
+    p_ct = sum(True_p[TreatmentGroup == 0])/n_ct,
+    theta = logit(p_tr) - logit(p_ct)
+  ) %>% distinct()
+}
+
+logit <- function(p) {
+  log(p/(1-p))
+}
+
+sim_procedure <- function(procedure,te_data,nChains,nBurn,nIter,
+                        weight,alpha.cb,beta.cb,threshold_sigma) {
+  #Formulate Dat for All the procedures, note that dat for procedure 1,2,3,4 are different from 5 (calibrated mixture)
+  K = nrow(te_data)
+  
+  dat <- list(
+    K = K,
+    Na = 2,
+    y = matrix(c(te_data$response_ct,te_data$response_tr),
+               nrow = K,
+               ncol = 2),
+    n = matrix(c(te_data$n_ct,te_data$n_tr),
+               nrow = K,
+               ncol = 2))
+  
+  dat2 <- list(
+    K = K,
+    Na = 2,
+    wMix = weight,
+    prior.exop =c(alpha.cb,beta.cb),
+    y = matrix(c(te_data$response_ct,te_data$response_tr),
+               nrow = K,
+               ncol = 2),
+    n = matrix(c(te_data$n_ct,te_data$n_tr),
+               nrow = K,
+               ncol = 2))
+  
+  if (procedure == 1 | procedure == 4){
+    #print(procedure)
+    te_dat <- dat
+  } else {
+    #print(procedure)
+    te_dat <- dat2
+  }
+  
+  # Inits
+  te_inits <- list(
+    list(mu = 0,
+         gamma = rep(-1.39,te_dat$K), #logit(0.2)
+         .RNG.name = c("base::Mersenne-Twister"),
+         .RNG.seed = c(7195)
+    ),
+    list(mu = 1.39, #Logit(0.5) - logit(0.2) = 1.39
+         gamma = rep(-1.39,te_dat$K), #logit(0.2)
+         .RNG.name = c("base::Mersenne-Twister"),
+         .RNG.seed = c(168422)
+    ))
+  
+   jagsmod <- case_when(
+     #procedure == 1 ~ "UninformativeIG.txt",
+     procedure == 1 ~ "UninformativeUnif.txt",
+     procedure == 2 ~ "CalibratedIG.txt",
+     procedure == 3 ~ "CalibratedMD.txt",
+     procedure == 4 ~ "UninformativeHalft.txt",
+   )
+   
+   # Initialize model
+   te_jm <- jags.model(jagsmod,
+                      data = te_dat,
+                      inits = te_inits,
+                      n.chains = nChains,
+                      quiet = TRUE)
+   
+  # burn-in
+  update(te_jm, n.iter = nBurn, progress.bar = "none")
+  
+  # Parameters to monitor
+  te_params <- c("p","theta","mu","var.sigma")
+  
+  # Draw Posterior samples
+  te_post <- coda.samples(te_jm,
+                          variable.names = te_params,
+                          n.iter = nIter,
+                          n.thin = 1,
+                          progress.bar = "none")
+  
+  # Posterior Summary
+  te_draws <- as_draws(te_post)
+  #print(summary(te_draws))
+  #print(summary(te_draws, default_mcse_measures()))
+  te_theta_post <- as_tibble(as_draws_matrix(te_post), 
+                             rownames = "Iteration") %>%
+    select("Iteration",starts_with("theta["))  
+  #print(te_theta_post)
+  #Posterior Inference 
+  output <- sapply(te_theta_post, function(x) 
+    (sum(x > threshold_sigma) / (nIter*nChains)))
+    }
+
+```
+
+## Simulate scenarios
+
+```{r trial, echo=FALSE, }
+trial <- c(10,16,20,16,14,12,20) #small subtrial size
+#trial <- c(50,70,80,60,100,80,60)  #Large Subtrial size
+#Scenario table 
+set.seed(43)
+sc1 = rep(0.2,14) # Global Null
+sc2 = c(0.7,0.2,0.7,0.2,0.7,0.2,0.7,0.2,rep(0.2,6)) # Mixed Null one
+sc3 = c(0.5,0.2,0.7,0.2,0.8,0.2,0.2,0.2,0.4,0.2,0.6,0.2,0.2,0.2) # Mixed Null two
+sc4 = c(0.7,0.2,0.6,0.2,0.5,0.2,0.4,0.2,0.35,0.2,0.5,0.2,0.6,0.2) 
+#Experimental Group Exactly same with the experts' opinion
+
+te_df1 <- scntb(trial,sc1)
+te_df2 <- scntb(trial,sc2)
+te_df3 <- scntb(trial,sc3)
+te_df4 <- scntb(trial,sc4)
+
+```
+
+### Calibrate theta according to the experts opinion
+
+fitSubtrial is a function which takes the experts opinion about response rates for experimental group and control group for each subtrial respectively, n represents the number of simulation. Here fitSubtrial is the function to numerically transform experts' opinion to the variable we are interested in (the treatment effect/log odds ratio). Rigorous transformation relates with Jacobian transformation.
+
+Weak input: the sum of a+b to be 3. pseudo data from 3 observations (strength of beta distribution)/if choose 1, we observe it like in one observation so that a1,a2, b1,b2 would be the crude estimation of response rate for experimental group and control group. Illustration purpose: set a+b = 3 vaguely it corresponds to the expected mean response rate on control treatment to be 0.3, strength of this input as if this was observed from 3 pesudo patients receiving this treatment. Then we take the mean response rate to suggest the average response rate is 30%. 
+
+Explanation for strength (how strong the opinion would be if expressed in the form of beta distribution is a+b, the larger value you give on a+b, the stronger opinion we regard it is)
+
+```{r}
+## Create beta random variables, and transform them to the logit scale
+### Ignore the question of how to transform the experts opinion (like range of response rate) to beta distribution for now
+
+fitSubtrial <- function(rr_E,rr_C,n){
+  #theta <- c()
+  #for (i in length(rr_E)){
+  set.seed(43)
+  a1 = 3 * rr_E; a2 = 3 * rr_C
+  b1 = 3 - a1; b2 = 3 - a2
+  pE    = rbeta(n=n, a1, b1) # note that the mean is given by a1/(a1+b1)
+  pC    = rbeta(n=n, a2, b2) # mean: a2/(a2+b2)
+  theta_seq = log(pE/(1-pE)) - log(pC/(1-pC))
+  #hist(pE, breaks = 100, freq=FALSE) 
+  #hist(pC, breaks = 100, freq=FALSE)
+  #hist(theta_seq, breaks = 100, freq=FALSE)
+  mean_theta <- mean(theta_seq)
+  sd_theta <- sd(theta_seq);var_theta <- var(theta_seq)
+  
+  # Calculate the density values for the fitted normal distribution
+  density_vals <- dnorm(theta_seq, mean = mean_theta, sd = sd_theta)
+
+  # Create a data frame for plotting
+  df <- data.frame(Theta = theta_seq, Density = density_vals)
+  
+  # Calculate the density values for the fitted normal distribution
+  density_vals <- dnorm(theta_seq, mean = mean_theta, sd = sd_theta)
+  
+  # Create a data frame for plotting
+  df <- data.frame(Theta = theta_seq, Density = density_vals)
+  
+  return(list(mean_theta,sd_theta,df))
+  #}
+}
+
+#c(0.7,0.2,0.6,0.2,0.5,0.25,0.4,0.15,0.35,0.25,0.5,0.2,0.6,0.3) 
+sc4_ex <- c(0.7,0.2,0.6,0.2,0.5,0.25,0.4,0.15,0.35,0.25,0.5,0.2,0.6,0.3) 
+experts_opinion <- list()
+for (i in 1:(length(sc4_ex)/2)){
+  experts_opinion[[i]] <- c(sc4_ex[2*i-1],sc4_ex[2*i])
+}
+mean.theta <- c();var.theta <- c()
+theta_df <- data.frame(Theta = c(), Density = c(), Group = c())
+
+for (i in 1:7){
+  n = 10000
+  mean.theta[i] <- fitSubtrial(experts_opinion[[i]][1],experts_opinion[[i]][2],n)[[1]] #subtrial-specific theta i
+  var.theta[i] <- fitSubtrial(experts_opinion[[i]][1],experts_opinion[[i]][2],n)[[2]]^2 #subtrial-specific variance of theta i
+  theta_df <- rbind(theta_df,fitSubtrial(experts_opinion[[i]][1],experts_opinion[[i]][2],n)[[3]] %>% mutate(Group = i))
+}
+
+exp.theta_hat <- mean(mean.theta)
+var.theta_hat <-sum(1/49*var.theta)
+mean_df <- data.frame(Group = c(1:7),Mean = mean.theta)
+```
+
+#### Calculate alpha and beta 
+
+```{r}
+# Correspond the hyperparameter for inverse-gamma distribution with the hyperparameter for t-distribution
+alpha.invgm = 0.08
+beta.invgm <- alpha.invgm / var.theta_hat
+df.t <- 2*alpha.invgm
+
+###### Density Plot of log odds ratio for all the seven subtrials ######
+ggplot(theta_df, aes(x = Theta, y = Density, color = as.factor(Group))) +
+  geom_line() +
+  #geom_vline(aes(xintercept=Mean,color = as.factor(Group)),
+  #          data=mean_df,linetype = "dashed",)+
+  labs(title = paste("Density Plots:Alpha = ",as.character(alpha.invgm)), x = "Theta", y = "Density",color = "Subtrial") +
+  theme_minimal()
+
+##### Location-Scale t-Distribution #####
+library(extraDistr)
+# Calculate the PDF of the t-distribution at each x value
+x <- seq(-10, 10, length = 1000)
+pdf <- dlst(x, df.t, mu = exp.theta_hat, sigma = sqrt(var.theta_hat))
+data <- data.frame(Theta = x, Density = pdf, Group = "Aggregated Mean")
+theta_df <- rbind(data,theta_df)
+
+ggplot(theta_df, aes(x = Theta, y = Density, color = as.factor(Group))) +
+  geom_line() +
+  #geom_vline(aes(xintercept=Mean,color = as.factor(Group)),
+  #          data=mean_df,linetype = "dashed",)+
+  labs(title = paste("Density Plots:Alpha = ",as.character(alpha.invgm)), x = "Theta", y = "Density",color = "Subtrial") +
+  theme_minimal()
+
+####### Calibrated Prior Plot ########
+#Prior
+set.seed(43)
+prior_var.sigma <- data.frame(var.sigma = rinvgamma(20000,alpha.invgm,beta.invgm))
+#prior2_var.sigma <- data.frame(var.sigma = runif(20000,0,100))
+
+#Posterior
+#post_var.sigma <- data.frame(as_draws_matrix(te_post6)) %>%
+#  select("var.sigma")
+ggplot()+
+  #geom_density(data = post_var.sigma,aes(x = var.sigma,col = "Posterior"))+
+  geom_density(data = prior_var.sigma,aes(x = var.sigma,col = "Prior"))+
+  labs(color = "Legend",x = "variance",
+       title = "Prior for Calibrated Inverse Gamma")+
+  xlim(0,30)+
+  ylim(0,0.75)
+```
+
+## Simulation Process
+
+```{r Simulation Study}
+kSim <- 2000
+theta_kSim1 <- list()
+theta_kSim2 <- list()
+theta_kSim3 <- list()
+theta_kSim4 <- list()
+
+#i represent the number of procedures 
+start_time <- Sys.time()
+#i represents the procedure
+for (i in 1:4) {
+  set.seed(43)
+  theta_kSim_temp1 <- data.frame(matrix(ncol = 7, nrow = 0))
+  theta_kSim_temp2 <- data.frame(matrix(ncol = 7, nrow = 0))
+  theta_kSim_temp3 <- data.frame(matrix(ncol = 7, nrow = 0))
+  theta_kSim_temp4 <- data.frame(matrix(ncol = 7, nrow = 0))
+  
+  colnames(theta_kSim_temp1) <- paste0("subtrial",1:7)
+  colnames(theta_kSim_temp2) <- paste0("subtrial",1:7)
+  colnames(theta_kSim_temp3) <- paste0("subtrial",1:7)
+  colnames(theta_kSim_temp4) <- paste0("subtrial",1:7)
+  
+  for (k in 1:kSim) {
+    te_df1 <- scntb(trial,sc1)
+    te_df2 <- scntb(trial,sc2)
+    te_df3 <- scntb(trial,sc3)
+    te_df4 <- scntb(trial,sc4)
+    #print(te_df)
+    theta1 <- sim_procedure(i,te_df1,2,2000,10000,c(0.5,0.5),
+                            alpha.invgm,beta.invgm ,logit(0.3)-logit(0.2))
+    theta2 <- sim_procedure(i,te_df2,2,2000,10000,c(0.5,0.5),
+                            alpha.invgm,beta.invgm ,logit(0.3)-logit(0.2))
+    theta3 <- sim_procedure(i,te_df3,2,2000,10000,c(0.5,0.5),
+                            alpha.invgm,beta.invgm ,logit(0.3)-logit(0.2))
+    theta4 <- sim_procedure(i,te_df4,2,2000,10000,c(0.5,0.5),
+                            alpha.invgm,beta.invgm ,logit(0.3)-logit(0.2))
+    
+    theta_kSim_temp1[k,1:7] <- theta1[2:8]
+    theta_kSim_temp2[k,1:7] <- theta2[2:8]
+    theta_kSim_temp3[k,1:7] <- theta3[2:8]
+    theta_kSim_temp4[k,1:7] <- theta4[2:8]
+    #print(theta_kSim_temp)
+    }
+  theta_kSim1[[i]] <- theta_kSim_temp1
+  theta_kSim2[[i]] <- theta_kSim_temp2
+  theta_kSim3[[i]] <- theta_kSim_temp3
+  theta_kSim4[[i]] <- theta_kSim_temp4
+  }
+
+print(theta_kSim1)
+print(theta_kSim2)
+print(theta_kSim3)
+print(theta_kSim4)
+end_time <- Sys.time()
+theta_kSim1
+theta_kSim2
+theta_kSim3
+theta_kSim4
+save(theta_kSim1,theta_kSim2,theta_kSim3,theta_kSim4, file = "results4.Rdata")
+#load("results2.Rdata")
+print(end_time - start_time)
+load("results4.Rdata")
+```
+
+#### Solving calibration problem attempt 
+
+```{r}
+temp1_sc4 <- data.frame(matrix(ncol = 7, nrow = 0))
+temp2_sc4 <- data.frame(matrix(ncol = 7, nrow = 0))
+temp3_sc4 <- data.frame(matrix(ncol = 7, nrow = 0))
+temp4_sc4 <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(temp1_sc4) <- paste0("subtrial",1:7)
+colnames(temp2_sc4) <- paste0("subtrial",1:7)
+colnames(temp3_sc4) <- paste0("subtrial",1:7)
+for (i in 1:kSim){
+  te_df4 <- scntb(trial,sc4)
+  a <- sim_procedure(1,te_df4,2,2000,10000,c(0.5,0.5),
++               alpha.invgm,beta.invgm ,logit(0.3)-logit(0.2))
+  b <- sim_procedure(2,te_df4,2,2000,10000,c(0.5,0.5),
++               alpha.invgm,beta.invgm ,logit(0.3)-logit(0.2))
+c <- sim_procedure(3,te_df4,2,2000,10000,c(0.5,0.5),
++               alpha.invgm,beta.invgm ,logit(0.3)-logit(0.2))
+  temp1_sc4[i,1:7] <- a[2:8]
+  temp2_sc4[i,1:7] <- b[2:8]
+  temp3_sc4[i,1:7] <- c[2:8]
+}
+print(sapply(temp1_sc4, function(x) (sum(x>0.9)/kSim)))
+print(sapply(temp2_sc4, function(x) (sum(x>0.9)/kSim)))
+print(sapply(temp3_sc4, function(x) (sum(x>0.9)/kSim)))
+```
+
+### Simulation Result 
+
+Set decision criterion quantity *zeta* to be 0.9 as a conventional choice. 
+
+```{r}
+# Explore the effect of choice of zeta
+# zeta <- seq(0.5,0.95,0.05)
+# 
+# for (i in zeta) {
+#   print(paste0("zeta is ",i))
+#   print(sapply(theta_kSim[[2]], function(x) (sum(x>i)/kSim)))
+# }
+
+# all 0.2; 0.7 0.7 0.7 0.7 0.2 0.2 0.2; 0.5,0.7,0.8,0.3,0.4,0.6,0.35;
+# 0.7,0.6,0.5,0.4,0.3,0.5,0.6
+# 0.2,0.2,0.25,0.15,0.3,0.2,0.3
+er1 <- list();er2 <- list();er3 <- list();er4 <- list()
+pw1 <- list();pw2 <- list();pw3 <- list();pw4 <- list()
+for (i in 1:4) {
+  er1[[i]] <- sapply(theta_kSim1[[i]], function(x) (sum(x>0.9)/kSim))
+  er2[[i]] <- sapply(theta_kSim2[[i]], function(x) (sum(x>0.9)/kSim))
+  er3[[i]] <- sapply(theta_kSim3[[i]], function(x) (sum(x>0.9)/kSim))
+  er4[[i]] <- sapply(theta_kSim4[[i]], function(x) (sum(x>0.9)/kSim))
+}
+pw1 <- er1;pw2 <- er2;pw3 <- er3;pw4 <- er4
+
+for (i in 1:4){
+  er2[[i]][which(sc2>0.3)%/%2 + 1] <- NA
+  pw2[[i]][-(which(sc2>0.3)%/%2 + 1)] <- NA
+  er3[[i]][which(sc3>0.3)%/%2 + 1] <- NA
+  pw3[[i]][-(which(sc3>0.3)%/%2 + 1)] <- NA
+  er4[[i]][which(sc4>0.3)%/%2 + 1] <- NA
+  pw4[[i]][-(which(sc4>0.3)%/%2 + 1)] <- NA
+}
+
+er1;er2;er3;er4;pw1;pw2;pw3;pw4
+```
+
+### Visualization
+
+#### Prior Plot 
+
+``` {r visualization, echo = F}
+#Prior
+library(invgamma)
+set.seed(43)
+#prior1 <- data.frame(var.sigma = rinvgamma(20000,1e-3,1e-3))
+prior2 <- data.frame(var.sigma = rinvgamma(20000,alpha.invgm,beta.invgm))
+prior3 <- data.frame(var.sigma = runif(20000,0,10^2))
+prior4 <- data.frame(var.sigma = rhalft(20000,df = 3,scale = 100))
+
+#Prior
+ggplot()+
+  #geom_density(data = prior1,aes(x = var.sigma,col = "Uninformative Inverse Gamma"))+
+  geom_density(data = prior2,aes(x = var.sigma,col = "Calibrated Inverse Gamma"))+
+  geom_density(data = prior3,aes(x = var.sigma,col = "Uniform Prior"))+
+  geom_density(data = prior4,aes(x = var.sigma,col = "Half-t Prior"))+
+  xlim(0,30)
+```
+
+#### Type 1 Error Rate & Statistical Power
+
+```{r}
+transform_er <- function(my_list){
+  df <- data.frame(Subtrial = character(), Procedure = factor(), ErrorRate = numeric(), stringsAsFactors = FALSE)
+  for (i in seq_along(my_list)) {
+    subtrial <- names(my_list[[i]])
+    procedure <- i
+    values <- my_list[[i]]
+    
+    df <- rbind(df, data.frame(Subtrial = subtrial, Procedure = procedure, ErrorRate = values, stringsAsFactors = FALSE))
+  }
+  df
+}
+
+r1 <- transform_er(er1) %>% mutate(Scenario = "Scenario 1")
+r2 <- transform_er(er2) %>% mutate(Scenario = "Scenario 2")
+r3 <- transform_er(er3) %>% mutate(Scenario = "Scenario 3")
+#r4 <- transform_er(result4) %>% mutate(Scenario = "Scenario 4")
+r_all <- rbind(r1,r2,r3)
+rownames(r_all) <- 1:length(rownames(r_all))
+
+prior_names <- c("Uninformative Uniform","Calibrated Inverse Gamma", "Calibrated Mixture","Uninformative Half-t")
+
+ggplot(data = r_all) +
+  geom_point(mapping = aes(x = Subtrial,y = ErrorRate,color = as.factor(Procedure),shape = as.factor(Procedure)))+
+  facet_wrap( ~ Scenario, nrow =1)+
+  labs(y = "Type-I Error Rate")+
+  scale_color_discrete(name = "Prior Choices",labels = prior_names) +
+  scale_shape_discrete(name = "Prior Choices",labels = prior_names) +
+  theme_bw()
+
+### Statistical Power ###
+p1 <- transform_er(pw2) %>% mutate(Scenario = "Scenario 2")
+p2 <- transform_er(pw3) %>% mutate(Scenario = "Scenario 3")
+p3 <- transform_er(pw4) %>% mutate(Scenario = "Scenario 4")
+p_all <- rbind(p1,p2,p3)
+rownames(p_all) <- 1:length(rownames(p_all))
+
+prior_names <- c("Uninformative Uniform","Calibrated Inverse Gamma", "Calibrated Mixture","Uninformative Half-t")
+
+ggplot(data = p_all) +
+  geom_point(mapping = aes(x = Subtrial,y = ErrorRate,color = as.factor(Procedure),shape = as.factor(Procedure)))+
+  facet_wrap( ~ Scenario, nrow =1)+
+  labs(y = "Statistical Power")+
+  scale_color_discrete(name = "Prior Choices",labels = prior_names) +
+  scale_shape_discrete(name = "Prior Choices",labels = prior_names) +
+  theme_bw()
+```
+
+# Data Example
+
+## Mixture Prior
+
+Formulate data for JAGS model. 
+
+```{r}
+set.seed(43)
+trial <- c(10,16,20,16,14,12,20) #small subtrial size
+sc3 = c(0.5,0.2,0.7,0.2,0.8,0.2,0.25,0.2,0.4,0.2,0.6,0.2,0.25,0.2) # Mixed Null two
+te_df <- scntb(trial,sc3)
+te_df
+
+te_dat <- list(
+  K = K,
+  Na = 2,
+  wMix = c(0.5,0.5),
+  prior.exop =c(alpha.invgm,beta.invgm),
+  y = matrix(c(te_df$response_ct,te_df$response_tr),
+             nrow = K,
+             ncol = 2),
+  n = matrix(c(te_df$n_ct,te_df$n_tr),
+             nrow = K,
+             ncol = 2))
+
+# numbers of chains, burn-in iterations and iterations to keep
+nChains <- 2
+nBurn <- 2000
+nIter <- 10000
+
+# Initialize model
+te_jm <- jags.model("CalibratedMD.txt",
+                    data = te_dat,
+                    inits = te_inits,
+                    n.chains = nChains)
+
+# burn-in
+update(te_jm, n.iter = nBurn)
+
+# Parameters to monitor
+te_params <- c("p","theta","mu","var.sigma","prec.sigma")
+
+# Draw Posterior samples
+te_post <- coda.samples(te_jm,
+                        variable.names = te_params,
+                        n.iter = nIter,
+                        n.thin = 1)
+
+# Posterior Summary
+te_draws <- as_draws(te_post)
+summary(as_draws(te_post))
+
+#Note that exponential is put here to adjust the log scale back to normal scale
+summary(as_draws(te_post), ~quantile(.x, probs = c(0.025,0.5,0.975)))
+summary(te_draws, default_mcse_measures())
+```
+
+### Prior and Posterior Plot
+
+Visualize the prior and posterior for variance parameter. 
+
+``` {r visualization, echo = F}
+set.seed(43)
+#Posterior
+post_var.sigma <- data.frame(as_draws_matrix(te_post)) %>%
+  select(c("var.sigma.1.","var.sigma.2."))
+
+#Prior
+prior_var.sigma <- data.frame(var.sigma = rinvgamma(nrow(post_var.sigma),alpha.invgm,beta.invgm))
+prior2_var.sigma <- data.frame(var.sigma = runif(nrow(post_var.sigma),0,100))
+
+prior_posterior <- data.frame(prior_var1 = prior_var.sigma$var.sigma,prior_var2 = prior2_var.sigma$var.sigma, 
+                              post_var1 = post_var.sigma$var.sigma.1., post_var2 = post_var.sigma$var.sigma.2.)
+
+ggplot(data = prior_posterior) +
+  geom_density(aes(x = prior_var1,linetype = "Prior", color = "Mixture Component 1 (Informative)")) +
+  geom_density(aes(x = prior_var2,linetype = "Prior", color = "Mixture Component 2 (Robust)")) +
+  geom_density(aes(x = post_var1,linetype = "Posterior", color = "Mixture Component 1 (Informative)")) +
+  geom_density(aes(x = post_var2,linetype = "Posterior", color = "Mixture Component 2 (Robust)")) +
+  xlim(0, 30) +
+  ylim(0, 0.75) +
+  labs(x = "Variance") 
+       # color = c("Prior","Posterior"),
+       # linetype = c("Mixture Component 1 (Informative)","Mixture Component 2 (Robust)"))
+
+```
+
+### Response rate plot
+
+``` {r visualization, echo = F}
+as_draws_matrix(te_post)
+te_p_post <- as_tibble(as_draws_matrix(te_post), rownames = "Iteration") %>%
+  select("Iteration",ends_with(",1]")) %>%
+  pivot_longer(
+    cols = contains("p"),
+    names_to = "Subtrial",
+    names_pattern = "p\\[(\\d+),1\\]",
+    values_to = "Response Rate"
+  ) %>%
+  mutate(
+    Group = "Control"
+  ) %>%
+  bind_rows(
+    as_tibble(as_draws_matrix(te_post), rownames = "Iteration") %>%
+      select("Iteration",ends_with(",2]")) %>%
+      pivot_longer(
+        cols = contains("p"),
+        names_to = "Subtrial",
+        names_pattern = "p\\[(\\d+),2\\]",
+        values_to = "Response Rate"
+      ) %>%
+      mutate(
+        Group = "Treatment"
+      )
+  )%>%
+  mutate(
+    Subtrial = factor(Subtrial,
+                   levels = 1:7,
+                   labels = c(paste0("Subtrial ",1:7))),
+    Group = factor(Group,
+                   levels = c("Control","Treatment"))
+    )
+
+# summary the 95% credible interval for response rate
+te_summary <- te_p_post %>%
+  group_by(Subtrial, Group) %>%
+  summarise(
+    Median = median(`Response Rate`),
+    Lower = quantile(`Response Rate`, probs = 0.025),
+    Upper = quantile(`Response Rate`, probs = 0.975),
+    .groups = "keep"
+  ) %>%
+  ungroup()
+
+true_rr <- c()
+for (i in 1:(length(te_df)-1)){
+  true_rr <- c(true_rr,te_df$p_ct[i],te_df$p_tr[i])
+}
+te_prior_rr <- data.frame(Subtrial = te_summary$Subtrial, Group = te_summary$Group, True_Response_Rate = true_rr)
+  
+
+forest_plot <- te_summary %>%
+  ggplot() +
+  aes(x = Median,y = reorder(Subtrial, desc(Subtrial)),
+      col = Group,shape = Group) +
+  geom_vline(xintercept = 0.2, linetype = "dashed", 
+             linewidth = 0.5, col = "grey")+
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper,height = 0),position = position_dodge(width=0.3)) +
+  geom_point(position = position_dodge(width = 0.3)) +
+  labs(y = NULL, x= "Response Rate") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(forest_plot)
+```
